@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtualenv
+venv/
+.env/
+.envrc
+
+# Django
+*.log
+staticfiles/
+media/
+db.sqlite3
+
+# Your sqlite db
+data/*.db
+data/*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Migrations cache
+**/migrations/__pycache__/

@@ -1,0 +1,33 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+  <h1>Glass catalog — Import / Export (JSON)</h1>
+
+  <div style="margin: 16px 0; padding: 12px; border: 1px solid #ddd; border-radius: 8px;">
+    <h2>Current catalog</h2>
+    <ul>
+      <li><b>GlassCard:</b> {{ counts.cards }}</li>
+      <li><b>GlassAlias:</b> {{ counts.aliases }}</li>
+      <li><b>GlassLine:</b> {{ counts.lines }}</li>
+      <li><b>GlassSize:</b> {{ counts.sizes }}</li>
+    </ul>
+  </div>
+
+  <div style="margin: 16px 0; padding: 12px; border: 1px solid #ddd; border-radius: 8px;">
+    <h2>Export</h2>
+    <p>Скачает JSON с каталогом стекол (cards/lines/aliases/sizes).</p>
+    <a class="button" href="{% url 'admin:panel_glasscard_export' %}">⬇️ Скачать JSON</a>
+  </div>
+
+  <div style="margin: 16px 0; padding: 12px; border: 1px solid #ddd; border-radius: 8px;">
+    <h2>Import</h2>
+    <form method="post" enctype="multipart/form-data" action="{% url 'admin:panel_glasscard_import' %}">
+      {% csrf_token %}
+      {{ form.as_p }}
+      <button class="button" type="submit">⬆️ Загрузить и импортировать</button>
+    </form>
+    <p style="color:#666; margin-top:8px;">
+      ⚠️ Если включен "Clear catalog before import" — текущий каталог будет удалён и залит заново.
+      Пользователи/сообщения/аналитика не трогаются.
+    </p>
+  </div>
+{% endblock %}

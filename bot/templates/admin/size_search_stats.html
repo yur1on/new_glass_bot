@@ -1,0 +1,43 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<h1>📊 Аналитика подбора стекла по размерам</h1>
+
+<h2>Общее</h2>
+<ul>
+  <li><b>Всего пользователей:</b> {{ total_users }}</li>
+  <li><b>Всего поисков по размерам:</b> {{ total_size_searches }}</li>
+  <li><b>Поисков за 7 дней:</b> {{ searches_7_days }}</li>
+  <li><b>Поисков за 30 дней:</b> {{ searches_30_days }}</li>
+</ul>
+
+<h2>Источники</h2>
+<table class="admin-table">
+  <tr>
+    <th>Source</th>
+    <th>Count</th>
+  </tr>
+  {% for row in sources %}
+  <tr>
+    <td>{{ row.source }}</td>
+    <td>{{ row.cnt }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>🔥 Топ размеров</h2>
+<table class="admin-table">
+  <tr>
+    <th>Height</th>
+    <th>Width</th>
+    <th>Count</th>
+  </tr>
+  {% for row in top_sizes %}
+  <tr>
+    <td>{{ row.height }}</td>
+    <td>{{ row.width }}</td>
+    <td>{{ row.cnt }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+{% endblock %}

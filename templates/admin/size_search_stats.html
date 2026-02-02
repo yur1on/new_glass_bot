@@ -1,0 +1,28 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<h1>📊 Size searches analytics</h1>
+
+<ul>
+  <li><b>Total users:</b> {{ total_users }}</li>
+  <li><b>Total size searches:</b> {{ total_size_searches }}</li>
+  <li><b>Last 7 days:</b> {{ searches_7_days }}</li>
+  <li><b>Last 30 days:</b> {{ searches_30_days }}</li>
+</ul>
+
+<h2>Sources</h2>
+<table class="adminlist">
+  <tr><th>Source</th><th>Count</th></tr>
+  {% for row in sources %}
+  <tr><td>{{ row.source }}</td><td>{{ row.cnt }}</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Top sizes</h2>
+<table class="adminlist">
+  <tr><th>Height</th><th>Width</th><th>Count</th></tr>
+  {% for row in top_sizes %}
+  <tr><td>{{ row.height }}</td><td>{{ row.width }}</td><td>{{ row.cnt }}</td></tr>
+  {% endfor %}
+</table>
+
+{% endblock %}
