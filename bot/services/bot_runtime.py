@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List
 from datetime import timedelta
 
 from aiogram import Bot, Dispatcher, types
@@ -93,7 +93,6 @@ def _looks_like_meta_line(s: str) -> bool:
         return True
     if "oled" in t or "pls" in t or "ips" in t:
         return True
-    # если строка выглядит как подпись/тег
     if t.startswith("<b>") and t.endswith("</b>"):
         return True
     return False
@@ -127,7 +126,6 @@ def apply_free_limit(lines: List[str], limit: int = PREMIUM_FREE_LIMIT) -> Tuple
         visible_models = model_lines[:limit]
         hidden = len(model_lines) - limit
 
-    # Сначала модели, затем мета (как правило Display лучше в конце)
     visible = visible_models + meta_lines
     return visible, hidden
 
@@ -146,6 +144,8 @@ def db_get_user(chat_id: int) -> Optional[User]:
 
 @sync_to_async(thread_sensitive=True)
 def db_save_message(chat_id: int, text: str) -> None:
+    # IMPORTANT: модели bot.models сейчас у тебя с managed=False и db_table="messages"
+    # Это ок, если таблица реально называется "messages".
     Message.objects.create(chat_id=chat_id, message_text=text or "")
 
 
@@ -175,7 +175,7 @@ def db_unblock_user(user_id: int) -> None:
 @sync_to_async(thread_sensitive=True)
 def db_get_belarus_chat_ids() -> List[int]:
     qs = User.objects.exclude(city__isnull=True).exclude(city__exact="")
-    out = []
+    out: List[int] = []
     for u in qs:
         if (u.city or "").strip().lower() in belarusian_cities:
             out.append(u.chat_id)
@@ -236,6 +236,11 @@ def db_find_sizes(height: float, width: float) -> List[dict]:
 # -------- Premium DB wrappers --------
 
 @sync_to_async(thread_sensitive=True)
+def db_get_subscription(chat_id: int) -> Optional[PremiumSubscription]:
+    return PremiumSubscription.objects.filter(chat_id=chat_id).first()
+
+
+@sync_to_async(thread_sensitive=True)
 def db_is_premium(chat_id: int) -> bool:
     sub = PremiumSubscription.objects.filter(chat_id=chat_id).first()
     return bool(sub and sub.active_until and sub.active_until >= timezone.now())
@@ -243,9 +248,7 @@ def db_is_premium(chat_id: int) -> bool:
 
 @sync_to_async(thread_sensitive=True)
 def db_get_active_plans() -> List[PremiumPlan]:
-    """
-    Берём 3 тарифа из БД. Если в БД их нет — вернём пустой список.
-    """
+    # Покажем все активные (у тебя 4 тарифа)
     return list(PremiumPlan.objects.filter(is_active=True).order_by("price_stars"))
 
 
@@ -256,7 +259,20 @@ def db_get_plan_by_code(code: str) -> Optional[PremiumPlan]:
 
 @sync_to_async(thread_sensitive=True)
 def db_activate_premium(chat_id: int, days: int) -> PremiumSubscription:
-    until = timezone.now() + timedelta(days=int(days))
+    """
+    ВАЖНО: если Premium уже активен — продлеваем от active_until.
+    Если не активен — считаем от сейчас.
+    """
+    now = timezone.now()
+    sub = PremiumSubscription.objects.filter(chat_id=chat_id).first()
+
+    if sub and sub.active_until and sub.active_until > now:
+        base = sub.active_until
+    else:
+        base = now
+
+    until = base + timedelta(days=int(days))
+
     sub, _ = PremiumSubscription.objects.update_or_create(
         chat_id=chat_id,
         defaults={"active_until": until},
@@ -297,7 +313,6 @@ async def create_menu_button():
         '🔎подбор стекла по размеру',
         web_app=types.WebAppInfo(url=add_src(WEBAPP_URL, "menu"))
     )
-
     premium_button = types.KeyboardButton('⭐ Premium')
 
     markup.add(start_button, registration_button, help_button)
@@ -306,13 +321,16 @@ async def create_menu_button():
     return markup
 
 
-def premium_inline_keyboard(plans: List[PremiumPlan]) -> types.InlineKeyboardMarkup:
+def premium_inline_keyboard(plans: List[PremiumPlan], active: bool) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
+    action = "Продлить" if active else "Купить"
     for p in plans[:4]:
-        kb.add(types.InlineKeyboardButton(
-            text=f"⭐ {p.title} — {p.duration_days} дн. — {p.price_stars} Stars",
-            callback_data=f"premium:buy:{p.code}",
-        ))
+        kb.add(
+            types.InlineKeyboardButton(
+                text=f"⭐ {action}: {p.title} — {p.duration_days} дн. — {p.price_stars} Stars",
+                callback_data=f"premium:buy:{p.code}",
+            )
+        )
     kb.add(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="premium:close"))
     return kb
 
@@ -344,7 +362,6 @@ def build_runtime():
         if ADMIN_ID and message.from_user.id != ADMIN_ID:
             await message.answer("У вас нет прав.")
             return
-
         try:
             user_id_to_block = int(message.text.split()[1])
             await db_block_user(user_id_to_block)
@@ -357,7 +374,6 @@ def build_runtime():
         if ADMIN_ID and message.from_user.id != ADMIN_ID:
             await message.answer("У вас нет прав.")
             return
-
         try:
             user_id_to_unblock = int(message.text.split()[1])
             await db_unblock_user(user_id_to_unblock)
@@ -386,7 +402,6 @@ def build_runtime():
                 sent += 1
             except Exception:
                 pass
-
         await message.answer(f"Сообщение отправлено. Доставлено: {sent}/{len(chat_ids)}")
 
     @dp.message_handler(commands=['send_to_user'])
@@ -394,7 +409,6 @@ def build_runtime():
         if ADMIN_ID and message.from_user.id != ADMIN_ID:
             await message.answer("У вас нет прав.")
             return
-
         try:
             user_id = int(message.text.split()[1])
             message_text = ' '.join(message.text.split()[2:])
@@ -417,28 +431,33 @@ def build_runtime():
     # ----------------- Premium: меню/покупка Stars -----------------
 
     async def show_premium_menu(chat_id: int):
-        if await db_is_premium(chat_id):
-            await bot.send_message(chat_id, "✅ Premium уже активен. Спасибо! ⭐")
-            return
+        sub = await db_get_subscription(chat_id)
+        now = timezone.now()
+        active = bool(sub and sub.active_until and sub.active_until >= now)
+
+        if active:
+            status = f"✅ <b>Premium активен</b>\nДо: <b>{sub.active_until:%d.%m.%Y %H:%M}</b>\n\n"
+        else:
+            status = "🔒 <b>Premium не активен</b>\n\n"
 
         plans = await db_get_active_plans()
-
-        # Если админ ещё не создал 3 тарифа — покажем подсказку
-        if len(plans) < 3:
+        if not plans:
             await bot.send_message(
                 chat_id,
+                status +
                 "⚠️ Тарифы Premium не настроены в админке.\n"
-                "Админу: создайте 3 PremiumPlan (например premium_7 / premium_30 / premium_90) и включите is_active.",
+                "Админу: создайте PremiumPlan и включите is_active.",
             )
             return
 
         await bot.send_message(
             chat_id,
-            "⭐ <b>Premium подписка</b>\n\n"
+            status +
+            "⭐ <b>Premium подписка</b>\n"
             "Без Premium показываем только 2 результата.\n"
             "С Premium — полный список без ограничений.\n\n"
             "Выберите тариф 👇",
-            reply_markup=premium_inline_keyboard(plans),
+            reply_markup=premium_inline_keyboard(plans, active=active),
         )
 
     @dp.message_handler(commands=["premium"])
@@ -469,19 +488,16 @@ def build_runtime():
         await call.answer()
         chat_id = call.from_user.id
 
-        if await db_is_premium(chat_id):
-            await bot.send_message(chat_id, "✅ Premium уже активен. ⭐")
-            return
-
         plan_code = call.data.split("premium:buy:", 1)[1].strip()
         plan = await db_get_plan_by_code(plan_code)
         if not plan:
             await bot.send_message(chat_id, "Тариф не найден или отключён. Напишите админу.")
             return
 
-        # payload должен быть уникальным, чтобы логировать оплату
+        # payload должен быть уникальным
         payload = f"premium:{chat_id}:{int(timezone.now().timestamp())}:{plan.code}"
 
+        # В Stars: currency="XTR" и provider_token="" (пустой)
         prices = [LabeledPrice(label=f"{plan.title} ({plan.duration_days} дней)", amount=int(plan.price_stars))]
 
         await bot.send_invoice(
@@ -489,15 +505,14 @@ def build_runtime():
             title=f"{plan.title}",
             description="Открывает полный список результатов без ограничений.",
             payload=payload,
-            provider_token="",     # Telegram Stars → пустой
-            currency="XTR",        # Stars currency
+            provider_token="",
+            currency="XTR",
             prices=prices,
             start_parameter="premium",
         )
 
     @dp.pre_checkout_query_handler(lambda q: True)
     async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
-        # Обязательно ответить OK
         await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
     @dp.message_handler(content_types=types.ContentType.SUCCESSFUL_PAYMENT)
@@ -508,7 +523,6 @@ def build_runtime():
         payload = sp.invoice_payload or ""
         plan_code = ""
         try:
-            # payload = premium:<chat_id>:<ts>:<plan_code>
             parts = payload.split(":")
             if len(parts) >= 4:
                 plan_code = parts[3]
@@ -533,8 +547,8 @@ def build_runtime():
         await bot.send_message(
             chat_id,
             f"✅ <b>Premium активирован!</b>\n"
-            f"Срок: {days} дней\n"
-            f"До: <b>{sub.active_until:%Y-%m-%d %H:%M}</b>\n\n"
+            f"Добавлено: {days} дней\n"
+            f"Действует до: <b>{sub.active_until:%d.%m.%Y %H:%M}</b>\n\n"
             "Теперь будут показываться все результаты без ограничений. ⭐"
         )
 
@@ -735,7 +749,6 @@ def build_runtime():
         found = await db_find_sizes(height, width)
         await db_save_size_search(chat_id, height, width, len(found), source)
 
-        # (опционально) лимит по размерам тоже можно включить — сейчас оставил полный список
         if found:
             await bot.send_message(
                 chat_id,
@@ -843,13 +856,11 @@ def build_runtime():
             await bot.send_message(chat_id, "Для пользования ботом зарегистрируйтесь: 👉 /registration")
             return
 
-        # ✅ ПОИСК В БД (GlassAlias -> card -> lines/photo)
         found = await db_find_card_by_alias(user_message_lower)
 
         if found:
             lines, photo = found
 
-            # ✅ Ограничение выдачи без Premium: показываем только 2 "модельные" строки
             premium = await db_is_premium(chat_id)
             hidden_count = 0
             if not premium:
@@ -868,8 +879,7 @@ def build_runtime():
                     f"\n🔒 <b>Ещё скрыто:</b> {hidden_count}\n"
                     f"⭐ Откройте всё: /premium"
                 )
-                # кнопка сразу открыть меню premium
-
+                keyboard.add(types.InlineKeyboardButton("⭐ Открыть всё (Premium)", callback_data="premium:show"))
 
             if photo:
                 keyboard.add(
@@ -880,7 +890,6 @@ def build_runtime():
             await bot.send_message(chat_id, "\n" + AD_TEXT, disable_web_page_preview=True)
             return
 
-        # ничего не найдено
         await bot.send_message(
             chat_id,
             "<em><b>По Вашему запросу ничего не найдено!</b>\n\n"
