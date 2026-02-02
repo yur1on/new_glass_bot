@@ -1,14 +1,17 @@
+# bot/services/bot_runtime.py
 import json
 import os
 import re
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
+from datetime import timedelta
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import LabeledPrice
 
 from asgiref.sync import sync_to_async
 from django.conf import settings
@@ -17,6 +20,9 @@ from django.utils import timezone
 # Django models
 from bot.models import User, Message, BlockedUser, SizeSearch
 from panel.models import GlassAlias, GlassLine, GlassSize
+
+# Premium app models (you должны создать app premium и применить миграции)
+from premium.models import PremiumPlan, PremiumSubscription, StarsPayment
 
 
 # ----------------- Настройки -----------------
@@ -69,6 +75,61 @@ def normalize_query(q: str) -> str:
 
 def add_src(url: str, src: str) -> str:
     return f"{url}&src={src}" if "?" in url else f"{url}?src={src}"
+
+
+# ----------------- Premium helpers -----------------
+
+PREMIUM_FREE_LIMIT = 2  # без премиума показываем 2 результата
+
+
+def _looks_like_meta_line(s: str) -> bool:
+    """
+    Строки-метаданные (типа Display: ...), которые не считаем "стеклами".
+    """
+    t = (s or "").strip().lower()
+    if not t:
+        return True
+    if "display" in t:
+        return True
+    if "oled" in t or "pls" in t or "ips" in t:
+        return True
+    # если строка выглядит как подпись/тег
+    if t.startswith("<b>") and t.endswith("</b>"):
+        return True
+    return False
+
+
+def split_lines_for_limit(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Возвращает (model_lines, meta_lines).
+    model_lines: то, что ограничиваем до 2 для free
+    meta_lines: показываем всегда (например Display: ...)
+    """
+    model_lines: List[str] = []
+    meta_lines: List[str] = []
+    for ln in (lines or []):
+        if _looks_like_meta_line(ln):
+            meta_lines.append(ln)
+        else:
+            model_lines.append(ln)
+    return model_lines, meta_lines
+
+
+def apply_free_limit(lines: List[str], limit: int = PREMIUM_FREE_LIMIT) -> Tuple[List[str], int]:
+    """
+    Возвращает (visible_lines, hidden_count) — ограничивает только "модельные" строки.
+    """
+    model_lines, meta_lines = split_lines_for_limit(lines)
+    if len(model_lines) <= limit:
+        visible_models = model_lines
+        hidden = 0
+    else:
+        visible_models = model_lines[:limit]
+        hidden = len(model_lines) - limit
+
+    # Сначала модели, затем мета (как правило Display лучше в конце)
+    visible = visible_models + meta_lines
+    return visible, hidden
 
 
 # ----------------- Django ORM helpers (async wrappers) -----------------
@@ -172,6 +233,58 @@ def db_find_sizes(height: float, width: float) -> List[dict]:
     return [{"model": x.model_name, "photo_path": x.photo_path} for x in qs]
 
 
+# -------- Premium DB wrappers --------
+
+@sync_to_async(thread_sensitive=True)
+def db_is_premium(chat_id: int) -> bool:
+    sub = PremiumSubscription.objects.filter(chat_id=chat_id).first()
+    return bool(sub and sub.active_until and sub.active_until >= timezone.now())
+
+
+@sync_to_async(thread_sensitive=True)
+def db_get_active_plans() -> List[PremiumPlan]:
+    """
+    Берём 3 тарифа из БД. Если в БД их нет — вернём пустой список.
+    """
+    return list(PremiumPlan.objects.filter(is_active=True).order_by("price_stars"))
+
+
+@sync_to_async(thread_sensitive=True)
+def db_get_plan_by_code(code: str) -> Optional[PremiumPlan]:
+    return PremiumPlan.objects.filter(code=code, is_active=True).first()
+
+
+@sync_to_async(thread_sensitive=True)
+def db_activate_premium(chat_id: int, days: int) -> PremiumSubscription:
+    until = timezone.now() + timedelta(days=int(days))
+    sub, _ = PremiumSubscription.objects.update_or_create(
+        chat_id=chat_id,
+        defaults={"active_until": until},
+    )
+    return sub
+
+
+@sync_to_async(thread_sensitive=True)
+def db_log_stars_payment(
+    chat_id: int,
+    plan: Optional[PremiumPlan],
+    payload: str,
+    currency: str,
+    total_amount: int,
+    telegram_charge_id: str,
+    provider_charge_id: str,
+) -> None:
+    StarsPayment.objects.create(
+        chat_id=chat_id,
+        plan=plan,
+        invoice_payload=payload,
+        currency=currency,
+        total_amount=total_amount,
+        telegram_payment_charge_id=telegram_charge_id or "",
+        provider_payment_charge_id=provider_charge_id or "",
+    )
+
+
 # ----------------- UI: клавиатуры -----------------
 
 async def create_menu_button():
@@ -185,9 +298,29 @@ async def create_menu_button():
         web_app=types.WebAppInfo(url=add_src(WEBAPP_URL, "menu"))
     )
 
+    premium_button = types.KeyboardButton('⭐ Premium')
+
     markup.add(start_button, registration_button, help_button)
     markup.add(size_button)
+    markup.add(premium_button)
     return markup
+
+
+def premium_inline_keyboard(plans: List[PremiumPlan]) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for p in plans[:4]:
+        kb.add(types.InlineKeyboardButton(
+            text=f"⭐ {p.title} — {p.duration_days} дн. — {p.price_stars} Stars",
+            callback_data=f"premium:buy:{p.code}",
+        ))
+    kb.add(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="premium:close"))
+    return kb
+
+
+def upgrade_inline_button() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⭐ Открыть всё (Premium)", callback_data="premium:show"))
+    return kb
 
 
 # ----------------- FSM: Регистрация -----------------
@@ -201,7 +334,7 @@ class UserRegistration(StatesGroup):
 # ----------------- Runtime builder -----------------
 
 def build_runtime():
-    bot = Bot(BOT_TOKEN)
+    bot = Bot(BOT_TOKEN, parse_mode="HTML")
     dp = Dispatcher(bot, storage=MemoryStorage())
 
     # ----------------- Админ команды -----------------
@@ -281,6 +414,130 @@ def build_runtime():
         else:
             await bot.send_message(chat_id, "Запись не найдена. Для регистрации: /registration")
 
+    # ----------------- Premium: меню/покупка Stars -----------------
+
+    async def show_premium_menu(chat_id: int):
+        if await db_is_premium(chat_id):
+            await bot.send_message(chat_id, "✅ Premium уже активен. Спасибо! ⭐")
+            return
+
+        plans = await db_get_active_plans()
+
+        # Если админ ещё не создал 3 тарифа — покажем подсказку
+        if len(plans) < 3:
+            await bot.send_message(
+                chat_id,
+                "⚠️ Тарифы Premium не настроены в админке.\n"
+                "Админу: создайте 3 PremiumPlan (например premium_7 / premium_30 / premium_90) и включите is_active.",
+            )
+            return
+
+        await bot.send_message(
+            chat_id,
+            "⭐ <b>Premium подписка</b>\n\n"
+            "Без Premium показываем только 2 результата.\n"
+            "С Premium — полный список без ограничений.\n\n"
+            "Выберите тариф 👇",
+            reply_markup=premium_inline_keyboard(plans),
+        )
+
+    @dp.message_handler(commands=["premium"])
+    async def premium_cmd(message: types.Message):
+        await db_save_message(message.chat.id, message.text)
+        await show_premium_menu(message.chat.id)
+
+    @dp.message_handler(lambda m: (m.text or "").strip() == "⭐ Premium")
+    async def premium_button_handler(message: types.Message):
+        await db_save_message(message.chat.id, message.text)
+        await show_premium_menu(message.chat.id)
+
+    @dp.callback_query_handler(lambda c: c.data == "premium:show")
+    async def premium_show_cb(call: types.CallbackQuery):
+        await call.answer()
+        await show_premium_menu(call.from_user.id)
+
+    @dp.callback_query_handler(lambda c: c.data == "premium:close")
+    async def premium_close_cb(call: types.CallbackQuery):
+        await call.answer("Ок")
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    @dp.callback_query_handler(lambda c: c.data and c.data.startswith("premium:buy:"))
+    async def premium_buy_cb(call: types.CallbackQuery):
+        await call.answer()
+        chat_id = call.from_user.id
+
+        if await db_is_premium(chat_id):
+            await bot.send_message(chat_id, "✅ Premium уже активен. ⭐")
+            return
+
+        plan_code = call.data.split("premium:buy:", 1)[1].strip()
+        plan = await db_get_plan_by_code(plan_code)
+        if not plan:
+            await bot.send_message(chat_id, "Тариф не найден или отключён. Напишите админу.")
+            return
+
+        # payload должен быть уникальным, чтобы логировать оплату
+        payload = f"premium:{chat_id}:{int(timezone.now().timestamp())}:{plan.code}"
+
+        prices = [LabeledPrice(label=f"{plan.title} ({plan.duration_days} дней)", amount=int(plan.price_stars))]
+
+        await bot.send_invoice(
+            chat_id=chat_id,
+            title=f"{plan.title}",
+            description="Открывает полный список результатов без ограничений.",
+            payload=payload,
+            provider_token="",     # Telegram Stars → пустой
+            currency="XTR",        # Stars currency
+            prices=prices,
+            start_parameter="premium",
+        )
+
+    @dp.pre_checkout_query_handler(lambda q: True)
+    async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
+        # Обязательно ответить OK
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+    @dp.message_handler(content_types=types.ContentType.SUCCESSFUL_PAYMENT)
+    async def successful_payment_handler(message: types.Message):
+        chat_id = message.chat.id
+        sp = message.successful_payment
+
+        payload = sp.invoice_payload or ""
+        plan_code = ""
+        try:
+            # payload = premium:<chat_id>:<ts>:<plan_code>
+            parts = payload.split(":")
+            if len(parts) >= 4:
+                plan_code = parts[3]
+        except Exception:
+            plan_code = ""
+
+        plan = await db_get_plan_by_code(plan_code) if plan_code else None
+        days = int(plan.duration_days) if plan else 30
+
+        await db_log_stars_payment(
+            chat_id=chat_id,
+            plan=plan,
+            payload=payload,
+            currency=sp.currency,
+            total_amount=int(sp.total_amount),
+            telegram_charge_id=getattr(sp, "telegram_payment_charge_id", "") or "",
+            provider_charge_id=getattr(sp, "provider_payment_charge_id", "") or "",
+        )
+
+        sub = await db_activate_premium(chat_id, days)
+
+        await bot.send_message(
+            chat_id,
+            f"✅ <b>Premium активирован!</b>\n"
+            f"Срок: {days} дней\n"
+            f"До: <b>{sub.active_until:%Y-%m-%d %H:%M}</b>\n\n"
+            "Теперь будут показываться все результаты без ограничений. ⭐"
+        )
+
     # ----------------- /size -----------------
 
     @dp.message_handler(commands=['size'])
@@ -298,7 +555,6 @@ def build_runtime():
             "🔎 <b>Подбор стекла по размерам</b>\n\n"
             "Нажмите кнопку 👇 «🔎подбор стекла по размеру».\n\n"
             "Если передумали — нажмите «↩️ В меню».",
-            parse_mode="html",
             reply_markup=kb
         )
 
@@ -318,6 +574,7 @@ def build_runtime():
             "✔️Для подбора стекла по размерам: кнопка «🔎подбор стекла по размеру» или команда /size\n\n"
             "✔️/registration - команда для регистрации\n\n"
             "✔️/delete_registration - команда для удаления своих регистрационных данных из базы\n\n"
+            "⭐ Premium: /premium — открыть полный список результатов\n\n"
             "✔️Если нашли ошибку или знаете взаимозаменяемую модель стекла, напишите пожалуйста @expert_glass_lcd\n",
             reply_markup=await create_menu_button()
         )
@@ -329,8 +586,8 @@ def build_runtime():
 
     # ----------------- /start и кнопка start -----------------
 
-    async def send_message_with_ad(chat_id: int, text: str, reply_markup=None, parse_mode="html"):
-        await bot.send_message(chat_id, text + "\n\nmobirazbor.by", reply_markup=reply_markup, parse_mode=parse_mode)
+    async def send_message_with_ad(chat_id: int, text: str, reply_markup=None):
+        await bot.send_message(chat_id, text + "\n\nmobirazbor.by", reply_markup=reply_markup)
 
     @dp.message_handler(commands=['start'])
     async def start_cmd(message: types.Message):
@@ -343,13 +600,16 @@ def build_runtime():
                 chat_id,
                 f"Привет👋, @{message.from_user.username}!\n"
                 "Введите модель стекла телефона или планшета, которое вы ищете.\n"
-                "Изучите информацию и откройте доп. кнопки 👉 /info"
+                "Изучите информацию и откройте доп. кнопки 👉 /info\n\n"
+                "⭐ Premium: /premium",
+                reply_markup=await create_menu_button(),
             )
         else:
             await send_message_with_ad(
                 chat_id,
                 "Это бот для поиска взаимозаменяемых стекол для переклейки.\n"
-                "Для пользования ботом, пожалуйста, зарегистрируйтесь! Используйте команду /registration"
+                "Для пользования ботом, пожалуйста, зарегистрируйтесь! Используйте команду /registration",
+                reply_markup=await create_menu_button(),
             )
 
     @dp.message_handler(lambda message: message.text == '🚀 start')
@@ -363,13 +623,16 @@ def build_runtime():
                 chat_id,
                 f"Привет👋, @{message.from_user.username}\n"
                 "Введите модель стекла телефона или планшета, которое вы ищете.\n"
-                "Изучите информацию и откройте доп. кнопки 👉 /info"
+                "Изучите информацию и откройте доп. кнопки 👉 /info\n\n"
+                "⭐ Premium: /premium",
+                reply_markup=await create_menu_button()
             )
         else:
             await bot.send_message(
                 chat_id,
                 "Это бот для поиска взаимозаменяемых стекол для переклейки.\n"
-                "Для пользования ботом, пожалуйста, зарегистрируйтесь! Используйте команду /registration"
+                "Для пользования ботом, пожалуйста, зарегистрируйтесь! Используйте команду /registration",
+                reply_markup=await create_menu_button()
             )
 
     # ----------------- Регистрация -----------------
@@ -472,20 +735,20 @@ def build_runtime():
         found = await db_find_sizes(height, width)
         await db_save_size_search(chat_id, height, width, len(found), source)
 
+        # (опционально) лимит по размерам тоже можно включить — сейчас оставил полный список
         if found:
             await bot.send_message(
                 chat_id,
                 f"<em><u>Стекла по размерам {height}x{width} найдено:</u></em>",
-                parse_mode="HTML"
             )
             for row in found:
                 model = row.get("model")
                 photo_path = row.get("photo_path") or ""
                 if photo_path and os.path.exists(photo_path):
                     with open(photo_path, "rb") as photo:
-                        await bot.send_photo(chat_id, photo, caption=f"<b>Модель:</b> {model}", parse_mode="HTML")
+                        await bot.send_photo(chat_id, photo, caption=f"<b>Модель:</b> {model}")
                 else:
-                    await bot.send_message(chat_id, f"<b>Модель:</b> {model}", parse_mode="HTML")
+                    await bot.send_message(chat_id, f"<b>Модель:</b> {model}")
         else:
             await bot.send_message(
                 chat_id,
@@ -501,7 +764,6 @@ def build_runtime():
     async def process_photo_callback(callback_query: types.CallbackQuery):
         photo_name = callback_query.data.split(':', 1)[1].strip()
 
-        # ищем файл в нескольких местах (как было + BASE_DIR)
         base_dir = Path(getattr(settings, "BASE_DIR", Path.cwd()))
         possible_paths = [
             base_dir / "photos1" / photo_name,
@@ -555,24 +817,24 @@ def build_runtime():
 
         # подсказки/валидация
         if 'galaxy' in user_message_lower:
-            await bot.send_message(chat_id, "Повторите пожалуйста запрос не используя слово <b>galaxy</b>.", parse_mode='html')
+            await bot.send_message(chat_id, "Повторите пожалуйста запрос не используя слово <b>galaxy</b>.")
             return
         if 'realmi' in user_message_lower:
-            await bot.send_message(chat_id, "❗️Исправте <u>realmi</u> на <b>realme</b>.", parse_mode='html')
+            await bot.send_message(chat_id, "❗️Исправте <u>realmi</u> на <b>realme</b>.")
             return
         if 'techno' in user_message_lower:
-            await bot.send_message(chat_id, "❗️Исправте <u>techno</u> на <b>tecno</b>.", parse_mode='html')
+            await bot.send_message(chat_id, "❗️Исправте <u>techno</u> на <b>tecno</b>.")
             return
         if 'tehno' in user_message_lower:
-            await bot.send_message(chat_id, "❗️Исправте <u>tehno</u> на <b>tecno</b>.", parse_mode='html')
+            await bot.send_message(chat_id, "❗️Исправте <u>tehno</u> на <b>tecno</b>.")
             return
         if '+' in user_message_lower:
-            await bot.send_message(chat_id, "❗️Исправте знак <u>+</u> на слово <b>plus</b>.", parse_mode='html')
+            await bot.send_message(chat_id, "❗️Исправте знак <u>+</u> на слово <b>plus</b>.")
             return
 
         # русский текст — просим английский
         if re.search(r"[а-яё]", user_message_lower):
-            await bot.send_message(chat_id, "Пожалуйста, пишите модель на <b>английском</b> языке.", parse_mode="html")
+            await bot.send_message(chat_id, "Пожалуйста, пишите модель на <b>английском</b> языке.")
             return
 
         # регистрация обязательна
@@ -587,21 +849,35 @@ def build_runtime():
         if found:
             lines, photo = found
 
-            keyboard = types.InlineKeyboardMarkup()
+            # ✅ Ограничение выдачи без Premium: показываем только 2 "модельные" строки
+            premium = await db_is_premium(chat_id)
+            hidden_count = 0
+            if not premium:
+                lines, hidden_count = apply_free_limit(lines, PREMIUM_FREE_LIMIT)
+
+            keyboard = types.InlineKeyboardMarkup(row_width=1)
+
             response = (
                 f"<em><u>Взаимозаменяемые стекла по поиску 🔍<b>'{user_message}'</b> найдено:</u></em>\n"
             )
-
             for line in lines:
                 response += f"{line}\n"
+
+            if hidden_count > 0:
+                response += (
+                    f"\n🔒 <b>Ещё скрыто:</b> {hidden_count}\n"
+                    f"⭐ Откройте всё: /premium"
+                )
+                # кнопка сразу открыть меню premium
+
 
             if photo:
                 keyboard.add(
                     types.InlineKeyboardButton("Посмотреть фото стекла", callback_data=f"photo:{photo}")
                 )
 
-            await bot.send_message(chat_id, response, reply_markup=keyboard, parse_mode='html')
-            await bot.send_message(chat_id, "\n" + AD_TEXT, parse_mode="html", disable_web_page_preview=True)
+            await bot.send_message(chat_id, response, reply_markup=keyboard)
+            await bot.send_message(chat_id, "\n" + AD_TEXT, disable_web_page_preview=True)
             return
 
         # ничего не найдено
@@ -614,7 +890,6 @@ def build_runtime():
             "👇 <b>нажмите кнопку внизу меню</b>\n"
             "«🔎подбор стекла по размеру»\n"
             "или команда /size</em>",
-            parse_mode="html",
             reply_markup=await create_menu_button()
         )
 
