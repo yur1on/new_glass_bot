@@ -1,0 +1,53 @@
+services:
+  db:
+    image: postgres:16
+    container_name: new_glass_bot_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - appnet
+
+  web:
+    build: .
+    container_name: new_glass_bot_web
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - db
+    command: >
+      sh -c "
+      python manage.py migrate &&
+      python manage.py collectstatic --noinput &&
+      python manage.py runserver 0.0.0.0:8000
+      "
+    ports:
+      - "8010:8000"
+    networks:
+      - appnet
+
+  bot:
+    build: .
+    container_name: new_glass_bot_bot
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - db
+    command: >
+      sh -c "
+      python manage.py migrate &&
+      python manage.py runbot
+      "
+    networks:
+      - appnet
+
+volumes:
+  pg_data:
+
+networks:
+  appnet:
+    driver: bridge
