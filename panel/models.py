@@ -50,7 +50,7 @@ class GlassSize(models.Model):
     model_name = models.CharField(max_length=255)
     height = models.DecimalField(max_digits=7, decimal_places=2, db_index=True)
     width = models.DecimalField(max_digits=7, decimal_places=2, db_index=True)
-    photo_path = models.CharField(max_length=255, blank=True, default="")
+    photo_path = models.CharField(max_length=1024, blank=True, default="")
 
     class Meta:
         indexes = [models.Index(fields=["height", "width"])]
