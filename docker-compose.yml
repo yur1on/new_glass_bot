@@ -12,6 +12,7 @@ services:
     networks:
       - appnet
 
+
   web:
     build: .
     container_name: new_glass_bot_web
@@ -24,8 +25,9 @@ services:
       sh -c "
       python manage.py migrate &&
       python manage.py collectstatic --noinput &&
-      python manage.py runserver 0.0.0.0:8000
+      python manage.py runserver 0.0.0.0:8000 --insecure
       "
+
     ports:
       - "8010:8000"
     networks:
